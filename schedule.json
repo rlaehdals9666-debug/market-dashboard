@@ -1,0 +1,13 @@
+{
+  "week": "예시 데이터 (실제 일정을 보내주시면 교체해 드려요)",
+  "updated": "2026-09-27",
+  "events": [
+    {"date": "2026-09-28", "time": "10:00", "country": "KR", "importance": 2, "event": "예시: 한국 산업활동동향", "actual": "", "forecast": "", "previous": ""},
+    {"date": "2026-09-29", "time": "23:00", "country": "US", "importance": 2, "event": "예시: 미국 소비자신뢰지수", "actual": "", "forecast": "", "previous": ""},
+    {"date": "2026-09-30", "time": "10:30", "country": "CN", "importance": 2, "event": "예시: 중국 제조업 PMI", "actual": "", "forecast": "", "previous": ""},
+    {"date": "2026-10-01", "time": "09:00", "country": "KR", "importance": 3, "event": "예시: 한국 수출입 동향", "actual": "", "forecast": "", "previous": ""},
+    {"date": "2026-10-01", "time": "23:00", "country": "US", "importance": 3, "event": "예시: 미국 ISM 제조업 PMI", "actual": "", "forecast": "", "previous": ""},
+    {"date": "2026-10-02", "time": "21:30", "country": "US", "importance": 3, "event": "예시: 미국 비농업 고용지수", "actual": "", "forecast": "", "previous": ""},
+    {"date": "2026-10-02", "time": "21:30", "country": "US", "importance": 3, "event": "예시: 미국 실업률", "actual": "", "forecast": "", "previous": ""}
+  ]
+}
