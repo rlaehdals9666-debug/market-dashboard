@@ -9,6 +9,7 @@
 
 import html
 import json
+import time
 from datetime import date, datetime, timezone
 from itertools import groupby
 from pathlib import Path
@@ -49,6 +50,8 @@ CRYPTO = {  # 업비트 마켓 코드
 NEWS_KEYWORDS = ["코스피", "미국 증시", "비트코인", "삼성전자", "엔비디아"]
 
 REFRESH_SECONDS = 30  # 시세 자동 갱신 주기(초)
+RANK_REFRESH_SECONDS = 10  # 순위 탭 자동 갱신 주기(초)
+TRADE_VALUE_TO_EOK = 0.01  # 키움 거래대금(백만원 단위) → 억원 변환
 # =====================================================================
 
 KST = ZoneInfo("Asia/Seoul")
@@ -146,6 +149,12 @@ button[data-testid="stBaseButton-pillsActive"] p,button[data-testid="stBaseButto
 .ev-imp{display:flex;gap:3px;padding-top:7px;}
 .dot{display:block;width:6px;height:6px;border-radius:50%;background:#E5E8EB;}
 .dot.on{background:var(--blue);}
+
+/* 순위 */
+.rank-no{width:26px;flex-shrink:0;text-align:center;font-size:16px;font-weight:700;color:var(--blue);font-variant-numeric:tabular-nums;}
+.rank-move{font-size:12px;font-weight:600;margin-left:6px;}
+.rank-move.up{color:var(--up);} .rank-move.down{color:var(--down);}
+.section-title{font-size:19px;font-weight:700;padding:14px 4px 6px;}
 </style>"""
 st.markdown(CSS, unsafe_allow_html=True)
 
@@ -223,6 +232,152 @@ def load_schedule():
         return None
     except json.JSONDecodeError:
         return "error"
+
+
+# ---------------------------------------------------------------------
+# 키움 REST API (조회 전용, 주문 기능 없음)
+# ---------------------------------------------------------------------
+KIWOOM_HOST = "https://api.kiwoom.com"
+
+
+class KiwoomError(Exception):
+    pass
+
+
+def kiwoom_keys():
+    """secrets.toml의 [kiwoom] 항목에서 키를 읽어요. 없으면 None."""
+    try:
+        k = st.secrets["kiwoom"]
+        return str(k["app_key"]).strip(), str(k["app_secret"]).strip()
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def kiwoom_token(app_key: str, app_secret: str) -> str:
+    r = requests.post(
+        f"{KIWOOM_HOST}/oauth2/token",
+        json={"grant_type": "client_credentials", "appkey": app_key, "secretkey": app_secret},
+        headers={"Content-Type": "application/json;charset=UTF-8"},
+        timeout=10,
+    )
+    try:
+        data = r.json()
+    except ValueError:
+        raise KiwoomError(f"토큰 발급 실패 (HTTP {r.status_code})")
+    token = data.get("token")
+    if not token:
+        raise KiwoomError(f"토큰 발급 실패: {data.get('return_msg') or data}")
+    return token
+
+
+def kiwoom_post(path: str, api_id: str, body: dict) -> dict:
+    keys = kiwoom_keys()
+    if not keys:
+        raise KiwoomError("키움 API 키가 설정되지 않았어요.")
+    for attempt in range(2):
+        token = kiwoom_token(*keys)
+        r = requests.post(
+            KIWOOM_HOST + path,
+            json=body,
+            headers={
+                "Content-Type": "application/json;charset=UTF-8",
+                "authorization": f"Bearer {token}",
+                "api-id": api_id,
+                "cont-yn": "N",
+                "next-key": "",
+            },
+            timeout=10,
+        )
+        try:
+            data = r.json()
+        except ValueError:
+            raise KiwoomError(f"응답을 읽지 못했어요 (HTTP {r.status_code})")
+        code = str(data.get("return_code", "0"))
+        if code == "0":
+            return data
+        msg = str(data.get("return_msg", ""))
+        if attempt == 0 and (r.status_code == 401 or "토큰" in msg or "token" in msg.lower()):
+            kiwoom_token.clear()
+            continue
+        raise KiwoomError(f"{msg} (코드 {code})")
+    raise KiwoomError("요청에 실패했어요.")
+
+
+def first_list(data: dict) -> list:
+    for v in data.values():
+        if isinstance(v, list):
+            return v
+    return []
+
+
+def to_num(v) -> float:
+    try:
+        return float(str(v).replace(",", "").replace("+", "").strip() or 0)
+    except ValueError:
+        return 0.0
+
+
+def pick(d: dict, *keys, default=""):
+    for k in keys:
+        if d.get(k) not in (None, ""):
+            return d[k]
+    return default
+
+
+def clean_code(code: str) -> str:
+    return str(code).split("_")[0]
+
+
+@st.cache_data(ttl=5, show_spinner=False)
+def get_kr_quotes_kiwoom(tickers: tuple) -> dict:
+    """키움 주식기본정보(ka10001)로 한국 주식 실시간 시세: {티커: (현재가, 전일 종가)}"""
+    result = {}
+    for t in tickers:
+        try:
+            data = kiwoom_post("/api/dostk/stkinfo", "ka10001", {"stk_cd": t.split(".")[0]})
+            cur = abs(to_num(data.get("cur_prc")))
+            diff = to_num(data.get("pred_pre"))
+            if cur:
+                result[t] = (cur, cur - diff)
+        except Exception:
+            pass
+        time.sleep(0.25)  # 호출 제한 여유
+    return result
+
+
+@st.cache_data(ttl=RANK_REFRESH_SECONDS, show_spinner=False)
+def get_trade_value_rank(mrkt_tp: str) -> list:
+    """거래대금상위(ka10032). mrkt_tp: 000 전체, 001 코스피, 101 코스닥"""
+    data = kiwoom_post("/api/dostk/rkinfo", "ka10032", {"mrkt_tp": mrkt_tp, "mang_stk_incls": "0", "stex_tp": "3"})
+    rows = []
+    for it in first_list(data)[:30]:
+        rows.append({
+            "name": str(pick(it, "stk_nm")),
+            "code": clean_code(pick(it, "stk_cd")),
+            "price": abs(to_num(pick(it, "cur_prc"))),
+            "rate": to_num(pick(it, "flu_rt")),
+            "value": to_num(pick(it, "trde_prica", "trde_amt")),
+        })
+    return rows
+
+
+@st.cache_data(ttl=RANK_REFRESH_SECONDS, show_spinner=False)
+def get_view_rank(qry_tp: str) -> list:
+    """실시간종목조회순위(ka00198)"""
+    data = kiwoom_post("/api/dostk/stkinfo", "ka00198", {"qry_tp": qry_tp})
+    rows = []
+    for it in first_list(data)[:30]:
+        rows.append({
+            "name": str(pick(it, "stk_nm")),
+            "code": clean_code(pick(it, "stk_cd")),
+            "rank": str(pick(it, "bigd_rank")),
+            "move": abs(to_num(pick(it, "rank_chg"))),
+            "move_sign": str(pick(it, "rank_chg_sign")),
+            "price": abs(to_num(pick(it, "past_curr_prc", "cur_prc"))),
+            "rate": to_num(pick(it, "base_comp_chgr", "flu_rt")),
+        })
+    return rows
 
 
 # ---------------------------------------------------------------------
@@ -351,11 +506,18 @@ def make_chart(series: pd.Series, color: str, value_format: str) -> alt.Chart:
 
 @st.fragment(run_every=REFRESH_SECONDS)
 def quotes_section() -> None:
-    stock_quotes = get_stock_quotes(tuple([*INDICES.values(), *KR_STOCKS.values(), *US_STOCKS.values()]))
+    stock_quotes = dict(get_stock_quotes(tuple([*INDICES.values(), *KR_STOCKS.values(), *US_STOCKS.values()])))
     crypto_quotes = get_crypto_quotes(tuple(CRYPTO.values()))
+    kiwoom_on = False
+    if kiwoom_keys():
+        kr = get_kr_quotes_kiwoom(tuple(KR_STOCKS.values()))
+        if kr:
+            stock_quotes.update(kr)
+            kiwoom_on = True
     now = datetime.now(KST)
 
-    show(f'<div class="tx updated">{now:%H:%M:%S} 기준, 코인은 실시간이고 주식은 최대 20분 늦을 수 있어요</div>')
+    note = "한국 주식은 키움 실시간" if kiwoom_on else "한국 주식은 최대 20분 늦을 수 있어요"
+    show(f'<div class="tx updated">{now:%H:%M:%S} 기준, 코인은 실시간이고 {note}</div>')
     show(index_grid(stock_quotes))
     show(stock_list("한국 주식", KR_STOCKS, stock_quotes, won, lambda c: c.split(".")[0]))
     show(stock_list("미국 주식", US_STOCKS, stock_quotes, usd, lambda c: c))
@@ -389,6 +551,110 @@ def chart_section() -> None:
 
         value_format = ",.0f" if fmt is won else ",.2f"
         st.altair_chart(make_chart(series, color, value_format), theme=None)
+
+
+def rate_text(rate: float) -> tuple:
+    if rate > 0:
+        return f"+{rate:.2f}%", "up"
+    if rate < 0:
+        return f"{rate:.2f}%", "down"
+    return "0.00%", "flat"
+
+
+def trade_value_chart(rows: list) -> alt.Chart:
+    df = pd.DataFrame(rows[:10])
+    df["eok"] = df["value"] * TRADE_VALUE_TO_EOK
+    base = alt.Chart(df).encode(
+        y=alt.Y("name:N", sort="-x", axis=alt.Axis(title=None, domain=False, ticks=False,
+                                                labelColor="#4E5968", labelFontSize=12, labelPadding=8)),
+        x=alt.X("eok:Q", axis=None),
+    )
+    bars = base.mark_bar(cornerRadiusEnd=6, height=16).encode(
+        color=alt.condition(alt.datum.rate > 0, alt.value(UP), alt.value(DOWN)),
+        tooltip=[alt.Tooltip("name:N", title="종목"),
+                 alt.Tooltip("eok:Q", title="거래대금(억)", format=",.0f"),
+                 alt.Tooltip("rate:Q", title="등락률(%)", format="+.2f")],
+    )
+    labels = base.mark_text(align="left", dx=6, color=FLAT, fontSize=11).encode(
+        text=alt.Text("eok:Q", format=",.0f"))
+    return (bars + labels).properties(height=len(df) * 30, width="container", background="transparent") \
+        .configure_view(strokeWidth=0)
+
+
+def rank_rows_trade(rows: list) -> str:
+    out = []
+    for i, r in enumerate(rows[:20], start=1):
+        rt, cls = rate_text(r["rate"])
+        out.append(
+            f'<div class="row"><div class="rank-no">{i}</div>'
+            f'<div class="row-main"><div class="row-name">{html.escape(r["name"])}</div>'
+            f'<div class="row-sub">거래대금 {r["value"] * TRADE_VALUE_TO_EOK:,.0f}억</div></div>'
+            f'<div class="row-right"><div class="row-price">{won(r["price"])}</div><div class="chg {cls}">{rt}</div></div></div>'
+        )
+    return "".join(out)
+
+
+def rank_rows_view(rows: list) -> str:
+    out = []
+    for i, r in enumerate(rows[:20], start=1):
+        rt, cls = rate_text(r["rate"])
+        move = ""
+        if r["move"] and r["move_sign"] in ("1", "2"):
+            move = f'<span class="rank-move up">▲{r["move"]:.0f}</span>'
+        elif r["move"] and r["move_sign"] in ("4", "5"):
+            move = f'<span class="rank-move down">▼{r["move"]:.0f}</span>'
+        rank = r["rank"] or str(i)
+        out.append(
+            f'<div class="row"><div class="rank-no">{html.escape(rank)}</div>'
+            f'<div class="row-main"><div class="row-name">{html.escape(r["name"])}{move}</div>'
+            f'<div class="row-sub">{html.escape(r["code"])}</div></div>'
+            f'<div class="row-right"><div class="row-price">{won(r["price"])}</div><div class="chg {cls}">{rt}</div></div></div>'
+        )
+    return "".join(out)
+
+
+@st.fragment(run_every=RANK_REFRESH_SECONDS)
+def ranking_section() -> None:
+    if not kiwoom_keys():
+        show('<div class="tx card"><div class="card-title">키움 API 연결이 필요해요</div>'
+             '<div class="empty">키움 API 키를 설정한 컴퓨터(또는 IP를 등록한 서버)에서 실행하면 '
+             '거래대금 순위와 실시간 조회순위가 여기에 표시돼요.</div></div>')
+        return
+
+    now = datetime.now(KST)
+    show(f'<div class="tx updated">{now:%H:%M:%S} 기준, {RANK_REFRESH_SECONDS}초마다 갱신돼요. '
+         f'장이 열리지 않은 시간에는 비어 있을 수 있어요</div>')
+
+    # 거래대금 상위
+    show('<div class="tx section-title">거래대금 상위</div>')
+    market = st.segmented_control("시장", ["전체", "코스피", "코스닥"], default="전체",
+                                  key="rank_market", label_visibility="collapsed") or "전체"
+    try:
+        rows = get_trade_value_rank({"전체": "000", "코스피": "001", "코스닥": "101"}[market])
+    except Exception as e:
+        rows = None
+        show(f'<div class="tx card"><div class="empty">거래대금 순위를 불러오지 못했어요: {html.escape(str(e))}</div></div>')
+    if rows:
+        with st.container(border=True):
+            st.altair_chart(trade_value_chart(rows), theme=None)
+        show(f'<div class="tx card">{rank_rows_trade(rows)}</div>')
+    elif rows is not None:
+        show('<div class="tx card"><div class="empty">표시할 데이터가 없어요.</div></div>')
+
+    # 실시간 조회순위
+    show('<div class="tx section-title">실시간 조회순위</div>')
+    periods = {"30초": "5", "1분": "1", "10분": "2", "1시간": "3", "당일": "4"}
+    period = st.segmented_control("기준", list(periods.keys()), default="1분",
+                                  key="view_period", label_visibility="collapsed") or "1분"
+    try:
+        vrows = get_view_rank(periods[period])
+    except Exception as e:
+        vrows = None
+        show(f'<div class="tx card"><div class="empty">조회순위를 불러오지 못했어요: {html.escape(str(e))}</div></div>')
+    if vrows:
+        show(f'<div class="tx card">{rank_rows_view(vrows)}</div>')
+    elif vrows is not None:
+        show('<div class="tx card"><div class="empty">표시할 데이터가 없어요.</div></div>')
 
 
 def news_section() -> None:
@@ -462,10 +728,12 @@ now = datetime.now(KST)
 show(f'<div class="tx hero"><div class="hero-date">{now.month}월 {now.day}일 {WEEKDAYS[now.weekday()]}</div>'
      f'<div class="hero-title">오늘의 시장</div></div>')
 
-tab_quotes, tab_news, tab_schedule = st.tabs(["시세", "뉴스", "일정"])
+tab_quotes, tab_rank, tab_news, tab_schedule = st.tabs(["시세", "순위", "뉴스", "일정"])
 with tab_quotes:
     quotes_section()
     chart_section()
+with tab_rank:
+    ranking_section()
 with tab_news:
     news_section()
 with tab_schedule:
